@@ -1,0 +1,261 @@
+
+# -*- coding: utf-8 -*-
+import numpy as np
+from scipy.optimize import fsolve
+from scipy.integrate import solve_ivp
+from scipy import ndimage
+import matplotlib.pyplot as plt
+from scipy.special import erf  
+
+
+#kept the same constants 
+alpha1, alpha2 = -1.0, -1.1
+b1, b2 = 7.0, 2.0 
+u1, u2 = 1.0, 1.0
+c = 1.5
+gamma1, gamma2 = 2.5, 1.5 
+gamma3 = -0.5 #not relaxation, coupling term
+
+
+#time
+t_range = (0,20) 
+t_eval = np.linspace(*t_range, 5)
+#intensity set to 10- justified in notes
+I_0 = 10
+k_0 = 2 * np.pi / 0.8e-6 #based on 800 lambda from original paper
+c_light= 3e8 #based on paper 
+tao = 0.1 #paper
+tc = 2 #paper 
+#T = 0.01 #temperature, can change to 0.001, basically the same 
+
+theta1 = 0
+theta2 = 0 #made it pi so that the phase differece is pi
+theta = theta2 - theta1 
+
+
+#equations V.4 with dmu_theta term as 0 - same phase 
+def equations(y, eq_v3): 
+    phi1, phi2 = y
+    eq_v4_1 = 0.5*alpha1*phi1 + 2 * u1 * phi1**3 + gamma3*phi2*np.cos(eq_v3)
+    eq_v4_2 = 0.5*alpha2*phi2 + 2 * u2 * phi2**3 + gamma3*phi1*np.cos(eq_v3)
+    return[ eq_v4_1, eq_v4_2]
+
+
+#initial values found through contour plot 
+v4_initial_values = [[0,0], [-1,-1], [1,1], [1, -1], [-0.6, 0.6]]
+minima = []
+for eq_v3 in [0.0, np.pi]:
+    print(eq_v3)
+    for value in v4_initial_values:
+        v4_minima = fsolve(equations, value, args = (eq_v3,))
+        if v4_minima[0] > 0 and v4_minima[1] > 0:  # only keep positive solutions
+            minima.append(v4_minima)
+            print(v4_minima)
+
+print(minima)
+phi1_0, phi2_0 = minima[1] #when theta is equal to pi 
+#[0.71, 0.721]
+
+
+#size
+rng = np.random.default_rng()
+N = 10 #number of grid points
+L = 10 #physical size of grid
+dx = L/N #spacing between grid points   
+
+
+def generate_noise(gamma, T, N):
+    sigma = np.sqrt(2*gamma*T)
+    noise = rng.normal(loc = 0, scale = sigma, size = (N,N))
+    return noise
+
+#free energy, equation V.4 integrated  
+def free_energy(phi1, phi2, eq_v3):
+    f = 0.25*alpha1*phi1**2 + 0.25*alpha2*phi2**2 + 0.5*u1*phi1**4 + 0.5*u2*phi2**4 + gamma3*phi1*phi2*np.cos(eq_v3)
+    return f
+
+
+def zeta(t):
+    sigma = k_0 * c_light * tao
+    p1 = np.sqrt(2 * np.pi) * (1 + (1/sigma**2)) 
+    p2 = erf(np.sqrt(2) * (t/tao))
+    p3 = 4 * (1/sigma**2) * (t/tao) * np.exp(-2 * ((t/tao)**2))
+    zeta = (p1  * p2) - p3 
+    return zeta 
+
+
+def intensity(t):
+    p1 = 1 + (4 * (t / (k_0 * c_light * tao**2))**2)
+    p2 = np.exp(-2 * ((t / tao)**2))
+    I = I_0 * p1 * p2
+    return I
+
+
+#flatten arrays 
+y0_flat = np.concatenate([[phi1_0, phi2_0], theta1_arr.flatten(), theta2_arr.flatten()])
+
+from tqdm import tqdm
+pbar = tqdm(total=t_range[1], desc="Solving", unit="t")
+last_t = [0.0]
+
+
+#added in noise
+def phi_time(t, y_flat):
+    dt = t - last_t[0]
+    if dt > 0:
+        pbar.update(dt)
+    last_t[0] = t
+    #reshape flattened arrays from solve_ivp
+    phi1 = y_flat[0]
+    phi2 = y_flat[1]
+    theta1 = y_flat[2:2+N*N].reshape(N,N)
+    theta2 = y_flat[2+N*N:2+2*N*N].reshape(N,N)
+    I = intensity(t)
+    theta = theta2 - theta1
+    
+    # vectorized laplacians
+    lap_theta1 = (np.roll(theta1,-1,axis=0) + np.roll(theta1,1,axis=0) +
+                  np.roll(theta1,-1,axis=1) + np.roll(theta1,1,axis=1) - 4*theta1) / dx**2
+    lap_theta2 = (np.roll(theta2,-1,axis=0) + np.roll(theta2,1,axis=0) +
+                  np.roll(theta2,-1,axis=1) + np.roll(theta2,1,axis=1) - 4*theta2) / dx**2
+    
+    theta1_gradient = np.gradient(theta1, dx) 
+    theta2_gradient = np.gradient(theta2, dx)
+    theta1_grad_sq = theta1_gradient[0]**2 + theta1_gradient[1]**2 # (∂μθ1)²
+    theta2_grad_sq = theta2_gradient[0]**2 + theta2_gradient[1]**2 # (∂μθ2)²
+
+    
+    #calculating the Aμ∂μθi
+    A = np.sqrt(I) 
+    A_d_mu_theta1 = np.mean(A * (theta1_gradient[0] + theta1_gradient[1]))
+    A_d_mu_theta2 = np.mean(A * (theta2_gradient[0] + theta2_gradient[1]))
+
+    #take mean of below terms so that phi1 and phi2 can be spatially uniform 
+    phi1_term = np.mean(theta1_grad_sq - 4*A_d_mu_theta1 + 4*I)
+    phi2_term = np.mean(theta2_grad_sq - 4*A_d_mu_theta2 + 4*I)
+    
+    dphi1_dt = -gamma1 * ((0.5*alpha1*phi1) + 0.5*b1*phi1*phi1_term + (2*u1*phi1**3) + (gamma3*phi2*np.mean(np.cos(theta))))     
+    dphi2_dt = -gamma2 * ((0.5*alpha2*phi2) + 0.5*b2*phi2*phi2_term + (2*u2*phi2**3) + (gamma3*phi1*np.mean(np.cos(theta)))) 
+    
+    
+    dtheta1_dt = -gamma1 * (-0.5*b1*(lap_theta1)*phi1 + gamma3*phi2*np.sin(theta)) #+ noise_theta1
+    dtheta2_dt = -gamma2 * (-0.5*b2*(lap_theta2)*phi2 + gamma3*phi1*np.sin(theta)) #+ noise_theta2
+    
+    derivatives_flat = np.concatenate([[dphi1_dt, dphi2_dt], dtheta1_dt.flatten(), dtheta2_dt.flatten()])
+    
+    return derivatives_flat
+
+
+#implementing the Euler-Maruyama method to implement the noise 
+dt = 0.001 
+t_values = np.arange(t_range[0], t_range[1], dt)
+
+
+
+y = y0_flat.copy()
+results = [y.copy()]
+t_stored = [t_values[0]]
+snapshots = []
+snapshot_times = []
+time_interval = 3000  # saves every 2000 timesteps
+
+
+
+for i, t in enumerate(t_values):
+    #changing temperature first
+    #uses laplacian method to diffuse heat based on neighbors temperatures 
+    corr = 0.1
+    lap_T = (np.roll(T_arr,-1,axis=0) + np.roll(T_arr,1,axis=0) +
+             np.roll(T_arr,-1,axis=1) + np.roll(T_arr,1,axis=1) - 4*T_arr) / dx**2
+    T_arr = T_arr + corr * lap_T * dt
+    
+    
+    dydt = phi_time(t, y)
+    noise1 = generate_noise(gamma1, T_arr, N).flatten()
+    noise2 = generate_noise(gamma2, T_arr, N).flatten()
+    noise_flat = np.concatenate([[0, 0], noise1, noise2])
+    y = y + dydt*dt + noise_flat*np.sqrt(dt)
+    results.append(y.copy())
+    t_stored.append(t)
+
+    # save snapshot every 100 steps
+    if i % time_interval == 0:
+        theta1_snap = y[2:2+N*N].reshape(N, N)
+        theta2_snap = y[2+N*N:2+2*N*N].reshape(N, N)
+        snapshots.append(theta2_snap - theta1_snap)
+        snapshot_times.append(t)
+        
+    
+results = np.array(results).T 
+t_stored = np.array(t_stored)
+
+
+#flattens arr for solve_ivp
+import time
+start = time.time()
+pbar.close()
+elapsed = time.time() - start
+print(f"Total runtime: {elapsed/60:.2f} minutes")
+
+
+
+
+
+
+
+
+#contains values for contourplot 
+phi1_values = np.linspace(-1, 1, 100)
+phi2_values= np.linspace(-1, 1, 100)
+[PHI1, PHI2] = np.meshgrid(phi1_values, phi2_values)
+F = free_energy(PHI1, PHI2, eq_v3) #added theta 
+print("got step 3")
+
+#contour plot 
+plt.figure(figsize=(8, 6))
+contour = plt.contourf(PHI1, PHI2, F, levels=500, alpha=0.7, cmap='viridis')
+plt.contour(PHI1, PHI2, F, levels=200, linewidths=0.2)
+plt.title('${\phi}$ Minima')
+plt.xlabel('${\phi}_1$')
+plt.ylabel('${\phi}_2$')
+plt.colorbar(contour) 
+plt.grid(True)
+plt.show()
+
+#calculates the average at a given point to plot against time
+theta1_avg = np.mean(results[2:2+N*N, :], axis=0)
+theta2_avg = np.mean(results[2+N*N:2+2*N*N, :], axis=0)
+
+#time evolution plot 
+plt.figure(figsize=(10, 6))
+plt.plot(t_stored , results[0], label='${\phi}_1$')
+plt.plot(t_stored , results[1], label='${\phi}_2$')
+#tried to plot theta as theta1 - theta2 based on paper - not sure if correct
+plt.plot(t_stored , theta2_avg-theta1_avg, label='$\\theta = \\theta_2 - \\theta_1$')
+plt.title('Time Dependence Plot')
+plt.xlabel('Time')
+plt.ylabel('${\phi}$ values')
+plt.legend()
+plt.grid(True)
+
+#plots theta domain walls
+fig, axes = plt.subplots(1, len(snapshots), figsize=(4*len(snapshots), 4))
+for idx, (snap, t_snap) in enumerate(zip(snapshots, snapshot_times)):
+    im = axes[idx].imshow(snap, vmin=0, vmax=2*np.pi, cmap='twilight')
+    axes[idx].set_title(f't = {t_snap:.2f}')
+plt.colorbar(im, ax=axes[-1], label='θ₂ - θ₁')
+plt.suptitle('Phase Domain Wall Evolution')
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
